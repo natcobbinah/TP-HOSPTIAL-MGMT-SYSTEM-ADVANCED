@@ -154,3 +154,10 @@ dotnet build
 
 # Run all tests
 dotnet test
+
+# Interact with API endpoints
+dotnet run --project HospitalSurgical.API
+```
+
+## Sample application Snapshots
+<img width="1918" height="1038" alt="hospital_surgical_apis" src="https://github.com/user-attachments/assets/9f128c30-4db4-4548-8b2c-dd02b2b1714b" />
