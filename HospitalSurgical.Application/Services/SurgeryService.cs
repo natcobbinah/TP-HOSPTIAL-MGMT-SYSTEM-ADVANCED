@@ -49,18 +49,19 @@ public class SurgeryService : ISurgeryService
 
             if (await _unitOfWork.Surgeries.HasConflictAsync(dto.SurgeonId, dto.PlannedDate, endTime))
                 throw new InvalidOperationException(
-                    $"Surgeon {surgeon.FullName} already has a surgery during this time slot.");
+                    $"Scheduling conflict: {surgeon.FullName} already has a surgery during this time slot.");
 
             // 3. Validate operating room
             var room = await _unitOfWork.OperatingRooms.GetByIdAsync(dto.OperatingRoomId)
                 ?? throw new KeyNotFoundException($"Operating room {dto.OperatingRoomId} not found.");
 
             if (room.Status == OperatingRoomStatus.UnderMaintenance)
-                throw new InvalidOperationException($"Operating room {room.RoomNumber} is under maintenance.");
+                throw new InvalidOperationException(
+                    $"Scheduling conflict: Operating room {room.RoomNumber} already has a surgery during this time slot.");
 
             if (await _unitOfWork.Surgeries.RoomHasConflictAsync(dto.OperatingRoomId, dto.PlannedDate, endTime))
                 throw new InvalidOperationException(
-                    $"Operating room {room.RoomNumber} already has a surgery during this time slot.");
+                    $"Scheduling conflict: Operating room {room.RoomNumber} already has a surgery during this time slot.");
 
             // 4. Create surgery
             var surgery = new Surgery
@@ -72,7 +73,8 @@ public class SurgeryService : ISurgeryService
                 Status = SurgeryStatus.Planned,
                 PatientId = dto.PatientId,
                 SurgeonId = dto.SurgeonId,
-                OperatingRoomId = dto.OperatingRoomId
+                OperatingRoomId = dto.OperatingRoomId,
+                ConcurrencyStamp = Guid.NewGuid().ToString()
             };
 
             await _unitOfWork.Surgeries.AddAsync(surgery);
@@ -119,20 +121,18 @@ public class SurgeryService : ISurgeryService
         var surgery = await _unitOfWork.Surgeries.GetWithDetailsAsync(id)
             ?? throw new KeyNotFoundException($"Surgery {id} not found.");
 
-        // 1️⃣ Validate status FIRST (tests expect ArgumentException here)
+        // 1️⃣ Validate status input first
         if (!Enum.TryParse<SurgeryStatus>(dto.Status, ignoreCase: true, out var newStatus))
             throw new ArgumentException($"Invalid status '{dto.Status}'.");
 
-        // 2️⃣ Business rule validation BEFORE concurrency check
+        // 2️⃣ Business rule validation
         if (surgery.Status == SurgeryStatus.Completed)
-            throw new InvalidOperationException(
-                "Cannot modify a completed surgery.");
+            throw new InvalidOperationException("Cannot modify a completed surgery.");
 
-        // 3️⃣ NOW check concurrency stamp
-        if (surgery.ConcurrencyStamp != dto.ConcurrencyStamp)
+        // 3️⃣ Optimistic concurrency check
+        if (!string.Equals(surgery.ConcurrencyStamp, dto.ConcurrencyStamp, StringComparison.Ordinal))
             throw new InvalidOperationException(
-                "CONCURRENCY_CONFLICT: This surgery was modified by another user. " +
-                "Please reload and try again.");
+                "CONCURRENCY_CONFLICT: This surgery was modified by another user.");
 
         // 4️⃣ Apply changes
         surgery.Status = newStatus;
@@ -140,7 +140,11 @@ public class SurgeryService : ISurgeryService
         if (!string.IsNullOrWhiteSpace(dto.Notes))
             surgery.Notes = dto.Notes;
 
-        // 5️⃣ Free operating room if needed
+        // 5️⃣ Generate new concurrency stamp for every update
+        var newStamp = Guid.NewGuid().ToString();
+        surgery.ConcurrencyStamp = newStamp;
+
+        // 6️⃣ Free room if surgery finished
         if (newStatus is SurgeryStatus.Completed or SurgeryStatus.Cancelled)
         {
             var room = await _unitOfWork.OperatingRooms.GetByIdAsync(surgery.OperatingRoomId);
@@ -160,7 +164,7 @@ public class SurgeryService : ISurgeryService
         catch (DbUpdateConcurrencyException)
         {
             throw new InvalidOperationException(
-                "CONCURRENCY_CONFLICT: Surgery was updated simultaneously. Reload and retry.");
+                "CONCURRENCY_CONFLICT: Surgery was updated simultaneously.");
         }
 
         return MapToDto(surgery, surgery.Patient, surgery.Surgeon as Surgeon, surgery.OperatingRoom);
@@ -171,7 +175,8 @@ public class SurgeryService : ISurgeryService
         var surgery = await _unitOfWork.Surgeries.GetWithDetailsAsync(id)
             ?? throw new KeyNotFoundException($"Surgery {id} not found.");
 
-        if (surgery.ConcurrencyStamp != dto.ConcurrencyStamp)
+        if (!string.IsNullOrWhiteSpace(dto.ConcurrencyStamp) &&
+                surgery.ConcurrencyStamp != dto.ConcurrencyStamp)
             throw new InvalidOperationException(
                 "CONCURRENCY_CONFLICT: Surgery was modified. Please reload.");
 
@@ -344,6 +349,7 @@ public class SurgeryService : ISurgeryService
             Status = surgery.Status.ToString(),
             ProcedureName = surgery.ProcedureName,
             Notes = surgery.Notes,
+            ConcurrencyStamp = surgery.ConcurrencyStamp,
             PatientId = surgery.PatientId,
             PatientName = patient is not null
                 ? $"{patient.FirstName} {patient.LastName}" : "Unknown",
